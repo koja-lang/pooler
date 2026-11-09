@@ -1,5 +1,8 @@
 # Pooler
 
+[![CI](https://github.com/koja-lang/pooler/actions/workflows/ci.yml/badge.svg)](https://github.com/koja-lang/pooler/actions/workflows/ci.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/koja-lang/pooler)](https://github.com/koja-lang/pooler/releases)
+
 A generic resource pool for [Koja](https://github.com/koja-lang/koja).
 Pools any value (database connections, sockets, sessions) behind a
 single process that lends resources to callers one at a time.
