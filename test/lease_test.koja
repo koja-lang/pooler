@@ -1,0 +1,42 @@
+alias Test.require
+
+struct LeaseTest
+  test "a lease returned twice is ignored the second time"
+    pool = int_pool(1)
+    lent = try require(pool.checkout(1000))
+
+    pool.checkin(lent)
+    pool.checkin(lent)
+
+    first = try require(pool.checkout(1000))
+    second = pool.checkout(100)
+    try require(pool.stop())
+
+    assert first.resource == 7
+
+    match second
+      Result.Err(Error.Timeout) -> ()
+      Result.Err(_) -> fail "expected Timeout error"
+      Result.Ok(_) -> fail "a repeated checkin must not grow the pool"
+    end
+  end
+
+  test "a lease the pool never issued is ignored"
+    pool = int_pool(1)
+    forged: Lease<Int> = Lease{resource: 99, token: Lease.Token{id: 12345}}
+
+    pool.checkin(forged)
+
+    first = try require(pool.checkout(1000))
+    second = pool.checkout(100)
+    try require(pool.stop())
+
+    assert first.resource == 7
+
+    match second
+      Result.Err(Error.Timeout) -> ()
+      Result.Err(_) -> fail "expected Timeout error"
+      Result.Ok(_) -> fail "a forged checkin must not grow the pool"
+    end
+  end
+end

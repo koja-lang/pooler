@@ -1,0 +1,30 @@
+@doc """
+Configuration for a pool. `create` is the resource factory. The pool
+calls it `size` times at startup and once per slot it needs to refill.
+The closure carries the concrete resource type, so the pool itself
+never needs to know how a resource is built.
+
+`valid` runs on every checked-in resource. When it returns false the
+pool drops the resource and refills the slot instead of lending it
+again. `None` accepts everything. A database pool passes the driver's
+own health predicate here, for example `c -> c.idle?()`.
+
+`destroy` runs on a resource that fails `valid` and on every shelved
+resource when the pool stops. A database pool closes the connection
+here. `None` drops the value.
+
+When the factory fails, at startup or while refilling a slot, the pool
+logs the error and retries on a timer. The first delay is drawn from
+`backoff_min_ms` to three times that, each later delay from a range
+that grows by up to three times again, and no delay exceeds
+`backoff_max_ms`. A success resets the delay. The random spread keeps
+pools that start together from retrying together.
+"""
+struct Config<T>
+  backoff_max_ms: Int = 30000
+  backoff_min_ms: Int = 1000
+  create: fn () -> Result<T, String>
+  destroy: Option<fn (T) -> ()> = Option.None
+  size: Int = 10
+  valid: Option<fn (T) -> Bool> = Option.None
+end

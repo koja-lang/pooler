@@ -1,0 +1,8 @@
+[project]
+authors = ["Henry Popp <henry@hpopp.dev>"]
+description = "A generic resource pool for Koja"
+experimental = true
+koja = "0.20"
+license = "MIT"
+name = "pooler"
+version = "0.1.0"

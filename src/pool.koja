@@ -1,0 +1,113 @@
+alias Process.CallError
+
+@doc """
+Why a pool operation failed. `InvalidConfig` names the `Config` field
+`start` rejected. `Timeout` means no resource was ready within the
+checkout timeout, whether every resource is lent out or the factory
+has not produced one yet. `PoolDown` means the pool process was
+stopped.
+"""
+enum Error
+  InvalidConfig(String)
+  PoolDown
+  Timeout
+end
+
+@doc """
+A handle to a running pool. Lends resource values to callers one at a
+time. `checkout` borrows a resource as a `Lease`, `checkin` returns
+the lease with its (possibly updated) resource, and `discard` hands
+back a lease whose resource is broken. When every resource is lent
+out, checkout callers queue in FIFO order and are answered as leases
+come back.
+
+The pool holds `size` slots and fills them in the background. A slot
+empties when a resource is discarded or fails `Config.valid` at
+checkin. The pool refills it with the factory right away, or on a
+backoff timer when the factory fails, so a database outage never
+shrinks the pool for good and a database that is down at startup
+only delays the first checkout.
+"""
+struct Pool<T>
+  ref: Ref<Msg<T>, Reply<T>>
+
+  @doc """
+  Spawns a pool process for `config`. The pool starts building
+  `config.size` resources at once and keeps retrying on the backoff
+  timer while the factory fails, so once `start` returns a pool, that
+  pool stays up. Checkouts queue until a resource is ready or their
+  timeout passes.
+
+  Fails with `Error.InvalidConfig` when `size` or `backoff_min_ms` is
+  below 1, or `backoff_min_ms` exceeds `backoff_max_ms`.
+  """
+  fn start(config: Config<T>) -> Pool<T> ! Error
+    if config.size < 1
+      fail Error.InvalidConfig("size must be at least 1")
+    end
+
+    if config.backoff_min_ms < 1
+      fail Error.InvalidConfig("backoff_min_ms must be at least 1")
+    end
+
+    if config.backoff_min_ms > config.backoff_max_ms
+      fail Error.InvalidConfig("backoff_min_ms must not exceed backoff_max_ms")
+    end
+
+    Pool{ref: spawn Server.start(config)}
+  end
+
+  @doc """
+  Borrows a resource, waiting up to `timeout_ms` for one to free up.
+  """
+  fn checkout(self, timeout_ms: Int = 5000) -> Lease<T> ! Error
+    match self.ref.call(Msg.Checkout, timeout_ms)
+      Result.Ok(Reply.Lent(lease)) -> lease
+      Result.Ok(_) -> Kernel.panic("pooler: unexpected reply to checkout")
+      Result.Err(CallError.Timeout) -> fail Error.Timeout
+      Result.Err(CallError.ProcessDown) -> fail Error.PoolDown
+    end
+  end
+
+  @doc """
+  Returns a lease to the pool. Its resource is the one lent to the
+  next borrower, so updates made while borrowed (a rebound connection,
+  a refreshed session) are preserved. A resource that fails
+  `Config.valid` is destroyed and its slot refilled instead. A lease
+  the pool did not issue, or already took back, is ignored.
+  """
+  fn checkin(self, lease: Lease<T>)
+    self.ref.cast(Msg.Checkin(lease))
+  end
+
+  @doc """
+  Hands back a lease whose resource is broken. The pool destroys the
+  resource and refills the slot with its factory, now or on the retry
+  timer. Returns once the pool has taken the report. A lease the pool
+  did not issue, or already took back, is ignored.
+  """
+  fn discard(self, lease: Lease<T>, timeout_ms: Int = 5000) ! Error
+    match self.ref.call(Msg.Discard(lease), timeout_ms)
+      Result.Ok(Reply.Done) -> ()
+      Result.Ok(_) -> Kernel.panic("pooler: unexpected reply to discard")
+      Result.Err(CallError.Timeout) -> fail Error.Timeout
+      Result.Err(CallError.ProcessDown) -> fail Error.PoolDown
+    end
+  end
+
+  @doc """
+  Stops the pool. Every shelved resource goes through `Config.destroy`
+  first, so a connection pool closes its idle connections. Lent
+  resources stay with their borrowers. Queued checkout callers see
+  `Error.PoolDown`. Returns once the pool has exited, and at once when
+  it already had.
+  """
+  fn stop(self, timeout_ms: Int = 5000) ! Error
+    match self.ref.call(Msg.Stop, timeout_ms)
+      Result.Ok(Reply.Done) -> ()
+      Result.Ok(_) -> Kernel.panic("pooler: unexpected reply to stop")
+      Result.Err(CallError.Timeout) -> fail Error.Timeout
+      Result.Err(CallError.ProcessDown) -> ()
+    end
+  end
+end

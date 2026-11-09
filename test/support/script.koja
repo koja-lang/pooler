@@ -1,0 +1,22 @@
+# Scripts a factory's outcomes. Each call pops the next Bool. Once
+# the script runs out, every call answers true.
+priv struct Script: Process<List<Bool>, (), Bool>
+  outcomes: List<Bool>
+
+  fn start(outcomes: List<Bool>) -> Self ! Process.StopReason
+    Script{outcomes: outcomes}
+  end
+
+  fn handle(self, msg: (), from: Option<ReplyTo<Bool>>) -> Process.Step<Self>
+    match self.outcomes.first()
+      Option.None ->
+        _ = ReplyTo.reply(from, true)
+
+      Option.Some(outcome) ->
+        _ = ReplyTo.reply(from, outcome)
+        self.outcomes = self.outcomes.slice(1, self.outcomes.length() - 1)
+    end
+
+    Process.Step.Continue(self)
+  end
+end

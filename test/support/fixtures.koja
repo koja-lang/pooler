@@ -1,0 +1,10 @@
+# A pool of `size` copies of the Int 7, built by a factory that never
+# fails.
+priv fn int_pool(size: Int) -> Pool<Int>
+  config = Config{
+    create: fn () -> Result<Int, String> Result.Ok(7) end,
+    size: size,
+  }
+
+  Pool.start(config).unwrap()
+end

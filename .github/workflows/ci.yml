@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prettier:
+    name: Prettier
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Prettier check
+        run: npx prettier@latest --check .
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install koja
+        uses: koja-lang/setup-koja@v1
+        with:
+          koja-version-file: koja.toml
+
+      - name: Koja format check
+        run: git ls-files '*.koja' | xargs koja format --check
+
+      - name: Typecheck
+        run: koja check
+
+      - name: Run tests
+        run: koja test

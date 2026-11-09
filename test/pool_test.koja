@@ -1,0 +1,174 @@
+alias Test.require
+
+struct PoolTest
+  test "start rejects an invalid config"
+    create = fn () -> Result<Int, String> Result.Ok(7) end
+
+    match Pool.start(Config{create: create, size: 0})
+      Result.Err(Error.InvalidConfig(_)) -> ()
+      Result.Err(_) -> fail "expected InvalidConfig for size 0"
+      Result.Ok(_) -> fail "a pool with no slots should be rejected"
+    end
+
+    match Pool.start(
+      Config{backoff_max_ms: 10, backoff_min_ms: 20, create: create, size: 1},
+    )
+      Result.Err(Error.InvalidConfig(_)) -> ()
+      Result.Err(_) ->
+        fail "expected InvalidConfig for an inverted backoff range"
+      Result.Ok(_) -> fail "an inverted backoff range should be rejected"
+    end
+  end
+
+  test "checkout lends a resource and checkin returns the updated value"
+    pool = int_pool(1)
+    first = try require(pool.checkout(1000))
+    assert first.resource == 7
+
+    first.resource = first.resource + 1
+    pool.checkin(first)
+
+    second = try require(pool.checkout(1000))
+    try require(pool.stop())
+
+    assert second.resource == 8
+  end
+
+  test "an exhausted pool queues callers until a checkin"
+    pool = int_pool(1)
+    lent = try require(pool.checkout(1000))
+    waiter = Task.async(fn () -> Result<Lease<Int>, Error>
+      pool.checkout(3000)
+    end)
+
+    pool.checkin(lent)
+
+    outcome = try require(Task.await(waiter))
+    try require(pool.stop())
+
+    answered = try require(outcome)
+    assert answered.resource == lent.resource
+  end
+
+  test "checkout times out when every resource stays lent"
+    pool = int_pool(1)
+    _ = try require(pool.checkout(1000))
+
+    second = pool.checkout(100)
+    try require(pool.stop())
+
+    match second
+      Result.Err(Error.Timeout) -> ()
+      Result.Err(_) -> fail "expected Timeout error"
+      Result.Ok(_) -> fail "checkout should not succeed on an exhausted pool"
+    end
+  end
+
+  test "checkin drops an invalid resource and refills the slot"
+    config = Config{
+      create: fn () -> Result<Int, String> Result.Ok(7) end,
+      size: 1,
+      valid: Option.Some(fn (n: Int) -> Bool n != 0 end),
+    }
+
+    pool = Pool.start(config).unwrap()
+    lent = try require(pool.checkout(1000))
+
+    lent.resource = 0
+    pool.checkin(lent)
+
+    replacement = try require(pool.checkout(1000))
+    try require(pool.stop())
+
+    assert replacement.resource == 7
+  end
+
+  test "an invalid checkin is destroyed before its slot refills"
+    sink = spawn Sink.start(())
+
+    config = Config{
+      create: fn () -> Result<Int, String> Result.Ok(7) end,
+      destroy: Option.Some(fn (n: Int) -> () sink.cast(Sink.Msg.Record(n)) end),
+      size: 1,
+      valid: Option.Some(fn (n: Int) -> Bool n != 0 end),
+    }
+
+    pool = Pool.start(config).unwrap()
+    lent = try require(pool.checkout(1000))
+
+    lent.resource = 0
+    pool.checkin(lent)
+
+    replacement = try require(pool.checkout(1000))
+    destroyed = try require(sink.call(Sink.Msg.Read, 1000))
+    try require(pool.stop())
+    sink.kill()
+
+    assert replacement.resource == 7
+    assert destroyed == [0]
+  end
+
+  test "discard builds a replacement resource"
+    pool = int_pool(1)
+    lent = try require(pool.checkout(1000))
+
+    try require(pool.discard(lent, 1000))
+
+    replacement = try require(pool.checkout(1000))
+    try require(pool.stop())
+
+    assert replacement.resource == 7
+  end
+
+  test "discard destroys the broken resource"
+    sink = spawn Sink.start(())
+
+    config = Config{
+      create: fn () -> Result<Int, String> Result.Ok(7) end,
+      destroy: Option.Some(fn (n: Int) -> () sink.cast(Sink.Msg.Record(n)) end),
+      size: 1,
+    }
+
+    pool = Pool.start(config).unwrap()
+    lent = try require(pool.checkout(1000))
+
+    lent.resource = 9
+    try require(pool.discard(lent, 1000))
+
+    destroyed = try require(sink.call(Sink.Msg.Read, 1000))
+    try require(pool.stop())
+    sink.kill()
+
+    assert destroyed == [9]
+  end
+
+  test "a stopped pool reports PoolDown"
+    pool = int_pool(1)
+    try require(pool.stop())
+
+    match pool.checkout(1000)
+      Result.Err(Error.PoolDown) -> ()
+      Result.Err(_) -> fail "expected PoolDown error"
+      Result.Ok(_) -> fail "checkout should not succeed on a stopped pool"
+    end
+  end
+
+  test "stop destroys the shelved resources and is idempotent"
+    sink = spawn Sink.start(())
+
+    config = Config{
+      create: fn () -> Result<Int, String> Result.Ok(7) end,
+      destroy: Option.Some(fn (n: Int) -> () sink.cast(Sink.Msg.Record(n)) end),
+      size: 2,
+    }
+
+    pool = Pool.start(config).unwrap()
+    try require(pool.stop())
+
+    destroyed = try require(sink.call(Sink.Msg.Read, 1000))
+    try require(pool.stop())
+    sink.kill()
+
+    assert destroyed == [7, 7]
+  end
+end

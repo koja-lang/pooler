@@ -1,0 +1,18 @@
+@doc """
+A borrowed resource. `resource` is the value on loan. Update it in
+place while borrowed and hand the lease back through `Pool.checkin`,
+or report it broken through `Pool.discard`. The pool recognizes the
+leases it issued, so a lease it never issued, or one already handed
+back, is ignored.
+"""
+struct Lease<T>
+  resource: T
+  token: Lease.Token
+end
+
+# Identifies a lease to the pool that issued it. Public only because
+# `Lease` carries it. Not for callers to construct or change.
+@doc false
+struct Lease.Token
+  id: Int
+end

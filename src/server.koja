@@ -1,0 +1,297 @@
+alias Process.Step
+alias Process.StopReason
+alias ReplyTo.Delivery
+
+# The pool's message contract, public only because `Pool.ref` names it.
+# Borrowers check a lease out, use the resource, and either check the
+# lease back in or discard it as broken. `Rebuild` is the pool's own
+# retry timer. `Stop` asks the pool to destroy its shelved resources
+# and exit.
+@doc false
+enum Msg<T>
+  Checkin(Lease<T>)
+  Checkout
+  Discard(Lease<T>)
+  Rebuild
+  Stop
+end
+
+# The pool's reply contract, public only because `Pool.ref` names it.
+# `Lent` answers a checkout. `Done` answers a discard or a stop.
+@doc false
+enum Reply<T>
+  Done
+  Lent(Lease<T>)
+end
+
+# The pool process behind a `Pool` handle. Never part of the public
+# surface. `Pool.start` spawns it and the `Ref` is the only line in.
+#
+# `missing` counts empty slots. `rebuilding?` is true while a Rebuild
+# timer is pending, so at most one timer is in flight.
+#
+# `leases` holds the token of every lease out on loan. A checkin or
+# discard whose token is not in the set is ignored, so a forged lease
+# or a second return of the same lease cannot grow the pool or slip a
+# stale value onto the shelf. `next_token` is the next id to mint.
+#
+# The backoff is the `rand_exp` strategy from Elixir's DBConnection.
+# `delay_ms` is the last delay drawn. The next one is uniform between
+# `min(delay_ms, lower_ms)` and `min(delay_ms * 3, backoff_max_ms)`,
+# where `lower_ms` is a third of the cap, so the steady state spreads
+# retries across the top two thirds of the cap.
+priv struct Server<T>: Process<Config<T>, Msg<T>, Reply<T>>
+  available: List<T> = []
+  backoff_max_ms: Int
+  backoff_min_ms: Int
+  create: fn () -> Result<T, String>
+  delay_ms: Int
+  destroy: Option<fn (T) -> ()>
+  leases: Set<Int>
+  lower_ms: Int
+  missing: Int
+  next_token: Int = 1
+  rebuilding?: Bool = false
+  valid: Option<fn (T) -> Bool>
+  waiting: List<ReplyTo<Reply<T>>> = []
+
+  fn start(config: Config<T>) -> Self ! StopReason
+    third = config.backoff_max_ms / 3
+
+    server = Server{
+      backoff_max_ms: config.backoff_max_ms,
+      backoff_min_ms: config.backoff_min_ms,
+      create: config.create,
+      delay_ms: config.backoff_min_ms,
+      destroy: config.destroy,
+      leases: Set.new(),
+      lower_ms: third > config.backoff_min_ms ? third : config.backoff_min_ms,
+      missing: config.size,
+      valid: config.valid,
+    }
+
+    server.refill()
+  end
+
+  fn handle(self, msg: Msg<T>, from: Option<ReplyTo<Reply<T>>>) -> Step<Self>
+    match msg
+      Msg.Checkin(lease) -> Step.Continue(self.checkin(lease))
+      Msg.Checkout -> Step.Continue(self.checkout(from))
+      Msg.Discard(lease) -> Step.Continue(self.discard(lease, from))
+      Msg.Rebuild -> Step.Continue(self.rebuild())
+      Msg.Stop -> self.stop(from)
+    end
+  end
+
+  # Takes a lease back. A valid resource goes to a waiter or the
+  # shelf. An invalid one is destroyed, its slot empties, and the pool
+  # refills it. A lease that is not on loan is ignored.
+  priv fn checkin(self, lease: Lease<T>) -> Self
+    if not self.on_loan?(lease.token)
+      return self
+    end
+
+    self.leases = self.leases.remove(lease.token.id)
+
+    if self.valid?(lease.resource)
+      return self.lend_or_stash(lease.resource)
+    end
+
+    self.release(lease.resource)
+    self.missing = self.missing + 1
+    self.refill()
+  end
+
+  # Whether `token` is out on loan. Warns when it is not, since that
+  # is always a caller bug, a forged lease or a second return.
+  priv fn on_loan?(self, token: Lease.Token) -> Bool
+    if self.leases.has?(token.id)
+      return true
+    end
+
+    Log.warn(
+      "Pool ignored a lease it did not issue or already took back.",
+      ["token": Log.Attribute.from(token.id)],
+    )
+    false
+  end
+
+  priv fn valid?(self, resource: T) -> Bool
+    match self.valid
+      Option.None -> true
+      Option.Some(check) -> check(resource)
+    end
+  end
+
+  priv fn release(self, resource: T)
+    match self.destroy
+      Option.None -> ()
+      Option.Some(tear_down) -> tear_down(resource)
+    end
+  end
+
+  # Destroys every shelved resource, acknowledges, and exits. Lent
+  # resources stay with their borrowers. Queued callers see the exit
+  # as `PoolDown`.
+  priv fn stop(self, from: Option<ReplyTo<Reply<T>>>) -> Step<Self>
+    for resource in self.available
+      self.release(resource)
+    end
+
+    done: Reply<T> = Reply.Done
+    _ = ReplyTo.reply(from, done)
+    Step.Done(StopReason.Normal)
+  end
+
+  # Destroys the discarded resource, empties its slot, refills it, and
+  # acknowledges. A lease that is not on loan is acknowledged and
+  # otherwise ignored.
+  priv fn discard(self, lease: Lease<T>, from: Option<ReplyTo<Reply<T>>>)
+    -> Self
+
+    done: Reply<T> = Reply.Done
+    _ = ReplyTo.reply(from, done)
+
+    if not self.on_loan?(lease.token)
+      return self
+    end
+
+    self.leases = self.leases.remove(lease.token.id)
+    self.release(lease.resource)
+    self.missing = self.missing + 1
+    self.refill()
+  end
+
+  # Answers a checkout from the shelf, or queues the caller. A cast
+  # checkout carries no reply channel and is dropped.
+  priv fn checkout(self, from: Option<ReplyTo<Reply<T>>>) -> Self
+    match from
+      Option.None ->
+        self
+
+      Option.Some(caller) ->
+        (popped, available) = self.available.pop()
+
+        match popped
+          Option.None ->
+            self.waiting = self.waiting.append(caller)
+            self
+
+          Option.Some(resource) ->
+            self.available = available
+
+            match self.offer(caller, resource)
+              Option.Some(lent) ->
+                lent
+
+              Option.None ->
+                # The caller gave up before we answered. Keep the resource.
+                self.available = self.available.append(resource)
+                self
+            end
+        end
+    end
+  end
+
+  # Hands `resource` to the oldest waiter still listening, or shelves it.
+  priv fn lend_or_stash(self, resource: T) -> Self
+    remaining = self.waiting
+
+    loop
+      match remaining.first()
+        Option.None ->
+          self.available = self.available.append(resource)
+          self.waiting = remaining
+          return self
+
+        Option.Some(waiter) ->
+          remaining = remaining.slice(1, remaining.length() - 1)
+
+          match self.offer(waiter, resource)
+            Option.Some(lent) ->
+              lent.waiting = remaining
+              return lent
+
+            # Stale waiter whose call already timed out. Keep scanning.
+            Option.None ->
+              ()
+          end
+      end
+    end
+  end
+
+  # Mints a lease on `resource` and sends it to `caller`. Returns the
+  # server with the loan recorded, or `None` when the caller had
+  # already given up, in which case nothing was recorded.
+  priv fn offer(self, caller: ReplyTo<Reply<T>>, resource: T) -> Option<Self>
+    id = self.next_token
+    lease = Lease{resource: resource, token: Lease.Token{id: id}}
+
+    match caller.send(Reply.Lent(lease))
+      Delivery.Delivered ->
+        self.leases = self.leases.insert(id)
+        self.next_token = id + 1
+        Option.Some(self)
+
+      Delivery.Expired ->
+        Option.None
+    end
+  end
+
+  # The Rebuild timer fired. Clear the flag and try the empty slots.
+  priv fn rebuild(self) -> Self
+    self.rebuilding? = false
+    self.refill()
+  end
+
+  # Builds a resource for every empty slot until the factory fails.
+  # Each success resets the backoff. The first failure arms the timer
+  # and leaves the remaining slots for the next tick. While a timer is
+  # pending the factory is left alone, so a discard during an outage
+  # does not turn the backoff into a retry per request.
+  priv fn refill(self) -> Self
+    if self.rebuilding?
+      return self
+    end
+
+    server = self
+
+    while server.missing > 0
+      match server.create()
+        Result.Ok(resource) ->
+          server.missing = server.missing - 1
+          server.delay_ms = server.backoff_min_ms
+          server = server.lend_or_stash(resource)
+
+        Result.Err(reason) ->
+          return server.schedule_rebuild(reason)
+      end
+    end
+
+    server
+  end
+
+  # Logs the factory failure, draws the next delay, and arms the
+  # Rebuild timer. Only called when no timer is pending.
+  priv fn schedule_rebuild(self, reason: String) -> Self
+    floor = self.delay_ms < self.lower_ms ? self.delay_ms : self.lower_ms
+    tripled = self.delay_ms * 3
+    ceiling = tripled < self.backoff_max_ms ? tripled : self.backoff_max_ms
+    delay = Random.int(floor, ceiling)
+
+    Log.error(
+      "Pool could not build a resource.",
+      [
+        "reason": Log.Attribute.from(reason),
+        "retry_in_ms": Log.Attribute.from(delay)
+      ],
+    )
+
+    me: Ref<Msg<T>, Reply<T>> = Ref.self_ref()
+    me.send_after(Msg.Rebuild, delay)
+
+    self.delay_ms = delay
+    self.rebuilding? = true
+    self
+  end
+end

@@ -1,0 +1,24 @@
+# Records the values a pool destroys so a test can read them back.
+priv struct Sink: Process<(), Sink.Msg, List<Int>>
+  seen: List<Int> = []
+
+  fn start(config: ()) -> Self ! Process.StopReason
+    Sink{}
+  end
+
+  fn handle(self, msg: Sink.Msg, from: Option<ReplyTo<List<Int>>>)
+    -> Process.Step<Self>
+
+    match msg
+      Sink.Msg.Read -> _ = ReplyTo.reply(from, self.seen)
+      Sink.Msg.Record(n) -> self.seen = self.seen.append(n)
+    end
+
+    Process.Step.Continue(self)
+  end
+end
+
+priv enum Sink.Msg
+  Read
+  Record(Int)
+end

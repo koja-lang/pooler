@@ -1,0 +1,87 @@
+alias Test.require
+
+struct ServerTest
+  test "a failing factory retries on a timer until it recovers"
+    # Startup succeeds, the next two builds fail, then it recovers.
+    script = spawn Script.start([true, false, false])
+
+    config = Config{
+      backoff_max_ms: 40,
+      backoff_min_ms: 10,
+      create: fn () -> Result<Int, String>
+        match script.call((), 1000)
+          Result.Ok(true) -> Result.Ok(7)
+          Result.Ok(false) -> Result.Err("boom")
+          Result.Err(_) -> Result.Err("script down")
+        end
+      end,
+      size: 1,
+    }
+
+    pool = Pool.start(config).unwrap()
+    lent = try require(pool.checkout(1000))
+
+    try require(pool.discard(lent, 1000))
+
+    # The slot is empty and the first retry fails too. The second
+    # retry, at most 80ms later, succeeds and answers the waiting
+    # checkout.
+    replacement = pool.checkout(1000)
+      rescue _ -> fail "pool never refilled the discarded slot"
+
+    try require(pool.stop())
+    script.kill()
+
+    assert replacement.resource == 7
+  end
+
+  test "a factory that fails at startup keeps the pool up"
+    config = Config{
+      backoff_max_ms: 40,
+      backoff_min_ms: 10,
+      create: fn () -> Result<Int, String> Result.Err("boom") end,
+      size: 1,
+    }
+
+    pool = Pool.start(config).unwrap()
+    outcome = pool.checkout(100)
+    alive = pool.ref.alive?()
+    try require(pool.stop())
+
+    assert alive
+
+    match outcome
+      Result.Err(Error.Timeout) -> ()
+      Result.Err(_) -> fail "expected Timeout error"
+      Result.Ok(_) -> fail "checkout should not succeed before the factory does"
+    end
+  end
+
+  test "a pool whose factory fails at startup fills once it recovers"
+    # The first two builds fail, then the factory recovers.
+    script = spawn Script.start([false, false])
+
+    config = Config{
+      backoff_max_ms: 40,
+      backoff_min_ms: 10,
+      create: fn () -> Result<Int, String>
+        match script.call((), 1000)
+          Result.Ok(true) -> Result.Ok(7)
+          Result.Ok(false) -> Result.Err("boom")
+          Result.Err(_) -> Result.Err("script down")
+        end
+      end,
+      size: 1,
+    }
+
+    pool = Pool.start(config).unwrap()
+
+    first = pool.checkout(1000)
+      rescue _ -> fail "pool never built its first resource"
+
+    try require(pool.stop())
+    script.kill()
+
+    assert first.resource == 7
+  end
+end
